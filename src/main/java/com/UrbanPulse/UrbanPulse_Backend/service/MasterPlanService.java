@@ -36,11 +36,13 @@ public class MasterPlanService {
     private static final String DEFAULT_COLOR = "#64748b";
 
     private final GeminiService gemini;
+    private final CityDnaService cityDnaService;
     private final ObjectMapper  mapper = new ObjectMapper();
 
     @Autowired
-    public MasterPlanService(GeminiService gemini) {
+    public MasterPlanService(GeminiService gemini, CityDnaService cityDnaService) {
         this.gemini = gemini;
+        this.cityDnaService = cityDnaService;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -52,7 +54,8 @@ public class MasterPlanService {
         List<PhaseInput> inputs = request.getPhases();
 
         // ── Step 1: Baseline ──────────────────────────────────────────────────
-        Metrics baseline = fetchBaseline(request.getCity(), request.getBudget());
+        CityDnaResponse dna = cityDnaService.getCityDna(request.getCity());
+        Metrics baseline = buildBaselineFromDna(dna);
         int baselineYear = deriveBaselineYear(inputs);
 
         // ── Step 2: Sequential phase simulation ───────────────────────────────
@@ -67,7 +70,7 @@ public class MasterPlanService {
             PhaseInput input = inputs.get(i);
             int duration = phaseDuration(inputs, i);
 
-            PhaseResult result = simulatePhase(input, current, request.getCity(), duration);
+            PhaseResult result = simulatePhase(input, current, request.getCity(), duration, dna);
             results.add(result);
             traj.add(toTrajectoryPoint(input.getYear(), result.getAfter()));
             current = result.getAfter();
@@ -95,51 +98,40 @@ public class MasterPlanService {
     //  STEP 1 — BASELINE
     // ─────────────────────────────────────────────────────────────────────────
 
-    private Metrics fetchBaseline(String city, String budget) {
-        String prompt = "You are an urban data expert.\n\n" +
-                "City: " + city + "\n" +
-                "Budget context: " + (budget != null ? budget : "Medium") + "\n\n" +
-                "Estimate the CURRENT urban health metrics for this city as a realistic baseline " +
-                "BEFORE any policy interventions. Use real-world knowledge to produce accurate " +
-                "starting numbers (e.g., Mumbai should have low traffic score due to congestion, " +
-                "Singapore should have high scores overall).\n\n" +
-                "STRICT RULES:\n" +
-                "* Return ONLY valid JSON — no markdown, no explanation\n" +
-                "* All scores are integers 0-100 where 100 = perfect/ideal\n\n" +
-                "Format:\n" +
-                "{\n" +
-                "  \"traffic\":   <int 0-100>,\n" +
-                "  \"economy\":   <int 0-100>,\n" +
-                "  \"ecology\":   <int 0-100>,\n" +
-                "  \"sentiment\": <int 0-100>\n" +
-                "}";
+    private Metrics buildBaselineFromDna(CityDnaResponse dna) {
+        CityCharacterScores scores = dna.getCharacterScores();
+        int inf = scores.getInfrastructure();
+        int gov = scores.getGovernance();
+        int res = scores.getResilience();
+        int liv = scores.getLiveability();
 
-        String json = gemini.call(prompt);
-        if (json != null) {
-            try {
-                JsonNode n = mapper.readTree(json);
-                return new Metrics(
-                        clamp(n.path("traffic").asInt(40)),
-                        clamp(n.path("economy").asInt(45)),
-                        clamp(n.path("ecology").asInt(45)),
-                        clamp(n.path("sentiment").asInt(50))
-                );
-            } catch (Exception e) {
-                System.err.println("[MasterPlanService] Failed to parse baseline: " + e.getMessage());
-            }
-        }
-        // Conservative fallback
-        return new Metrics(38, 44, 48, 52);
+        int traffic   = clamp((int) Math.round(inf * 0.6 + gov * 0.2 + res * 0.2));
+        int economy   = clamp((int) Math.round(gov * 0.5 + inf * 0.3 + liv * 0.2));
+        int ecology   = clamp((int) Math.round(res * 0.6 + liv * 0.3 + gov * 0.1));
+        int sentiment = clamp((int) Math.round(liv * 0.6 + res * 0.2 + gov * 0.2));
+
+        return new Metrics(traffic, economy, ecology, sentiment);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  STEP 2 — SINGLE PHASE
     // ─────────────────────────────────────────────────────────────────────────
 
-    private PhaseResult simulatePhase(PhaseInput input, Metrics before, String city, int duration) {
+    private PhaseResult simulatePhase(PhaseInput input, Metrics before, String city, int duration, CityDnaResponse dna) {
+
+        String cityContext = "City Context for " + city + ":\n" +
+                "- Density: " + dna.getDensityCategory() + ", Economic Profile: " + dna.getEconomicProfile() + "\n" +
+                "- Existing Transit Quality: " + dna.getExistingTransitQuality() + "/100\n" +
+                "- Character: Infrastructure " + dna.getCharacterScores().getInfrastructure() + "/100, " +
+                "Governance " + dna.getCharacterScores().getGovernance() + "/100, " +
+                "Resilience " + dna.getCharacterScores().getResilience() + "/100, " +
+                "Liveability " + dna.getCharacterScores().getLiveability() + "/100\n" +
+                "- Known policy risks for this city: " + String.join(", ", dna.getPoliticalResistance()) + "\n" +
+                "- City character: " + dna.getCityVerdict() + "\n" +
+                "Use this context to make your simulation scores city-specific.\n\n";
 
         String prompt = "You are an urban planning simulation engine.\n\n" +
-                "City: " + city + "\n" +
+                cityContext +
                 "Policy: " + input.getLabel() + " (" + input.getPolicy() + ")\n" +
                 "Implementation period: " + duration + " year(s)\n\n" +
                 "Current city state (before this policy):\n" +
